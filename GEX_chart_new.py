@@ -17,6 +17,7 @@ ticker_filter = None
 start_date_filter = None
 end_date_filter = None
 tree = None
+DB_PATH = "stocks.db"
 
 # 全域狀態追蹤使用者選擇
 user_conflict_choice = None  # "skip" 或 "overwrite" 或 "cancel"
@@ -26,7 +27,7 @@ inserted_count = 0
 
 # --- 資料庫相關 ---
 def init_db():
-    conn = sqlite3.connect("stocks.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS stock_data (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,7 +86,7 @@ def insert_data(ticker, date, label, value):
     if cancel_import:
         return
 
-    conn = sqlite3.connect("stocks.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     cursor.execute("SELECT id FROM stock_data WHERE ticker=? AND date=? AND label=?", (ticker, date, label))
@@ -191,7 +192,6 @@ def bulk_import():
         refresh_table()
         messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
 
-
 def import_from_excel():
     global user_conflict_choice, apply_to_all, cancel_import, inserted_count
     user_conflict_choice = None
@@ -207,12 +207,32 @@ def import_from_excel():
         xls = pd.ExcelFile(file_path)
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet_name)
-            if 'Date' in df.columns and 'TV Code' in df.columns:
-                for date, tv_code in zip(df['Date'].dropna(), df['TV Code'].dropna()):
-                    if cancel_import:
-                        messagebox.showinfo("已取消", f"成功寫入 {inserted_count} 筆資料。")
-                        return
-                    parse_gex_code(str(date).split(" ")[0], str(tv_code))
+            # 如果沒有 Date 欄，就跳過這個 sheet
+            if 'Date' not in df.columns:
+                continue
+
+            # 逐列匯入
+            for _, row in df.iterrows():
+                if cancel_import:
+                    messagebox.showinfo("已取消", f"成功寫入 {inserted_count} 筆資料。")
+                    return
+
+                # 取出日期，轉成 YYYY-MM-DD 字串
+                date_val = row['Date']
+                try:
+                    date_str = str(pd.to_datetime(date_val).date())
+                except:
+                    date_str = str(date_val)
+
+                # 其他所有欄位都當作 label 列出
+                for col in df.columns:
+                    if col == 'Date':
+                        continue
+                    value = row[col]
+                    # 跳過空值
+                    if pd.isna(value):
+                        continue
+                    insert_data(sheet_name, date_str, col, value)
 
         if not cancel_import:
             populate_ticker_dropdown()
@@ -221,9 +241,8 @@ def import_from_excel():
     except Exception as e:
         messagebox.showerror("匯入錯誤", str(e))
 
-
 def fetch_data(filter_ticker="", start_date=None, end_date=None):
-    conn = sqlite3.connect("stocks.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     query = "SELECT * FROM stock_data WHERE 1=1"
     params = []
@@ -248,7 +267,7 @@ def delete_selected():
     for item in selected:
         values = tree.item(item, "values")
         ticker, date, label, value = values
-        conn = sqlite3.connect("stocks.db")
+        conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute("DELETE FROM stock_data WHERE ticker=? AND date=? AND label=? AND value=?", (ticker, date, label, value))
         conn.commit()
@@ -271,7 +290,7 @@ def refresh_table():
 
 
 def populate_ticker_dropdown():
-    conn = sqlite3.connect("stocks.db")
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT ticker FROM stock_data")
     tickers = [r[0] for r in cursor.fetchall()]
@@ -280,6 +299,106 @@ def populate_ticker_dropdown():
         ticker_filter['values'] = tickers
         ticker_filter.set(tickers[0])
 
+# 資料庫 helper：取得所有 ticker
+def get_all_tickers():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT ticker FROM stock_data")
+    rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+# 資料庫 helper：刪除既有當日 OHLC
+def delete_ohlc(ticker, date_str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM stock_data WHERE ticker = ? AND date = ? AND label IN ('Open','High','Low','Close')",
+        (ticker, date_str)
+    )
+    conn.commit()
+    conn.close()
+
+# 更新 OHLC 按鈕的 callback
+def update_ohlc(selected_date_input):
+    """
+    根據 calendar 選擇的日期，批次迴圈所有 ticker，
+    從 yfinance 批次下載該日的 OHLC 資料，並寫入資料庫。
+    支援傳入 DateEntry 物件、widget、字串或日期。
+    """
+    try:
+        raw = selected_date_input
+        # 處理不同 DateEntry 類型
+        from ttkbootstrap.widgets import DateEntry as TtkDateEntry
+        from tkcalendar import DateEntry as TkDateEntry
+        if isinstance(raw, TtkDateEntry):
+            raw = raw.entry.get()
+        elif isinstance(raw, TkDateEntry):
+            raw = raw.get_date()
+        elif hasattr(raw, 'get_date'):
+            raw = raw.get_date()
+        elif hasattr(raw, 'entry') and hasattr(raw.entry, 'get'):
+            raw = raw.entry.get()
+        elif hasattr(raw, 'get'):
+            raw = raw.get()
+
+        # 轉為 datetime.date
+        date = pd.to_datetime(raw).date()
+        next_day = date + pd.Timedelta(days=1)
+
+        tickers = get_all_tickers()
+        # 根據 TV market 指數欄位前綴
+        ticker_names = [f"^{t}" if t in ["SPX","NDX","VIX"] else t for t in tickers]
+
+        # 批次下載所有 ticker 的單日資料
+        df = yf.download(
+            tickers=ticker_names,
+            start=date,
+            end=next_day,
+            interval="1d",
+            group_by="ticker",
+            progress=False,
+            auto_adjust=False
+        )
+
+        count = 0
+        for t in tickers:
+            name = f"^{t}" if t in ["SPX","NDX","VIX"] else t
+            # 若為多層索引，取該 ticker 區段，否則為單一 DataFrame
+            data = df[name] if isinstance(df.columns, pd.MultiIndex) else df
+            if data.empty:
+                continue
+            row = data.iloc[0]
+            ohlc = {
+                'Open': float(row['Open']),
+                'High': float(row['High']),
+                'Low': float(row['Low']),
+                'Close': float(row['Close'])
+            }
+            # 刪除舊資料後插入
+            delete_ohlc(t, str(date))
+            for label, value in ohlc.items():
+                insert_data(t, str(date), label, value)
+            count += 1
+
+        messagebox.showinfo("更新完成", f"已成功為 {count} 支 ticker 更新 {date} 的 OHLC 資料。")
+    except Exception as e:
+        messagebox.showerror("更新失敗", str(e))
+                
+# 資料庫 helper：從資料庫抓取指定 ticker 的所有 OHLC 歷史資料
+def fetch_historical_ohlc_from_db(ticker):
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        "SELECT date, label, value FROM stock_data WHERE ticker = ? AND label IN ('Open','High','Low','Close')",
+        conn,
+        params=(ticker,)
+    )
+    conn.close()
+    if df.empty:
+        return pd.DataFrame()
+    df['date'] = pd.to_datetime(df['date'])
+    pivot = df.pivot(index='date', columns='label', values='value')
+    return pivot.sort_index()
 
 def plot_graph():
     selected_ticker = ticker_filter.get()
@@ -295,27 +414,36 @@ def plot_graph():
     df["date"] = pd.to_datetime(df["date"])
     df.sort_values("date", inplace=True)
 
-    # 下載歷史數據
-    ticker_name = f"^{selected_ticker}" if selected_ticker in ["SPX", "NDX", "VIX"] else selected_ticker
-    value_3m = yf.download(ticker_name, period="3mo", interval="1d", multi_level_index=False)
-    value_3m = value_3m.reset_index()
-    value_3m.rename(columns={"Date": "date"}, inplace=True)
-    value_3m["date"] = pd.to_datetime(value_3m["date"])
-
     fig = go.Figure()
 
-    # 繪製 GEX 折線圖
-    for label in df["label"].unique():
-        subset = df[df["label"] == label]
-        fig.add_trace(go.Scatter(x=subset["date"], y=subset["value"], mode="lines+markers", name=label))
+    # 要排除不畫出的資料
+    exclude_labels = ['Open', 'High', 'Low', 'Close', 'Flip %', 'TV Code']
 
+    # 繪製 GEX 折線圖（排除指定 labels）
+    for label in df["label"].unique():
+        if label in exclude_labels:
+            continue
+        subset = df[df["label"] == label]
+        fig.add_trace(go.Scatter(
+            x=subset["date"],
+            y=subset["value"],
+            mode="lines+markers",
+            name=label
+        ))
+
+    # 從資料庫取得資料
+    ohlc_df = fetch_historical_ohlc_from_db(selected_ticker)
+    if ohlc_df.empty or any(col not in ohlc_df.columns for col in ['Open','High','Low','Close']):
+        messagebox.showwarning("缺少資料", f"{selected_ticker} 沒有任何完整的 OHLC 歷史資料。")
+        return
+    
     # 繪製 OHLC 圖表
     fig.add_trace(go.Candlestick(
-        x=value_3m["date"],
-        open=value_3m["Open"],
-        high=value_3m["High"],
-        low=value_3m["Low"],
-        close=value_3m["Close"],
+        x=ohlc_df.index,
+        open=ohlc_df["Open"],
+        high=ohlc_df["High"],
+        low=ohlc_df["Low"],
+        close=ohlc_df["Close"],
         name=selected_ticker + ' OHLC'
     ))
 
@@ -359,6 +487,8 @@ def build_gui():
     gex_entry.grid(row=1, column=1, padx=5, sticky=W)
 
     ttk.Button(entry_frame, text="新增記錄", bootstyle=SUCCESS, command=single_entry).grid(row=2, column=1, sticky=W, pady=5)
+    btn_update_ohlc = tk.Button(entry_frame, text="更新 OHLC", command=lambda: update_ohlc(calendar_date))
+    btn_update_ohlc.grid(row=2, column=1, padx=5, pady=5)
 
     filter_frame = ttk.LabelFrame(main, text="篩選條件", padding=10)
     filter_frame.grid(row=2, column=0, columnspan=2, sticky=W+E)
@@ -388,6 +518,23 @@ def build_gui():
     tree.heading("Label", text="Label")
     tree.heading("Value", text="Value")
     tree.pack(side=LEFT, fill=BOTH, expand=True)
+
+    def copy_selected_values(event=None):
+        sel = tree.selection()
+        if not sel:
+            return
+        # 取出每一列的第 4 欄（index=3），也就是 Value
+        vals = [tree.item(item, 'values')[3] for item in sel]
+        text = '\n'.join(str(v) for v in vals)
+        # 複製到剪貼簿
+        root.clipboard_clear()
+        root.clipboard_append(text)
+        # 若要顯示提示可取消下行
+        # messagebox.showinfo("複製完成", f"已複製 {len(vals)} 筆 Value")
+    
+    # 綁定 Ctrl+C（Windows/Linux）與 Command+C（macOS）
+    tree.bind('<Control-c>', copy_selected_values)
+    tree.bind('<Command-c>', copy_selected_values)
 
     scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=scrollbar.set)
