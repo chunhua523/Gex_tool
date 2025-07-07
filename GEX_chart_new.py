@@ -219,10 +219,17 @@ def import_from_excel():
 
                 # 取出日期，轉成 YYYY-MM-DD 字串
                 date_val = row['Date']
-                try:
-                    date_str = str(pd.to_datetime(date_val).date())
-                except:
-                    date_str = str(date_val)
+                # 新增：若日期欄為空，則使用今天日期
+                if pd.isna(date_val) or (isinstance(date_val, str) and date_val.strip() == ""):
+                    date_obj = calendar_date.entry.get()
+                else:
+                    try:
+                        date_obj = pd.to_datetime(date_val).date()
+                    except Exception:
+                        # 若無法轉換為 datetime，就原樣取出
+                        date_obj = date_val
+
+                date_str = str(date_obj)
 
                 # 其他所有欄位都當作 label 列出
                 for col in df.columns:
