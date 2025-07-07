@@ -1,6 +1,12 @@
+import auto_requirements
+auto_requirements.ensure_requirements()
+
+import os
 import sqlite3
+import tempfile
 import tkinter as tk
 from tkinter import messagebox, filedialog
+import traceback
 import pandas as pd
 import plotly.graph_objects as go
 import yfinance as yf
@@ -8,6 +14,9 @@ import re
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from ttkbootstrap.widgets import DateEntry
+from gspread.exceptions import APIError
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # 全域控件
 root = None
@@ -17,7 +26,12 @@ ticker_filter = None
 start_date_filter = None
 end_date_filter = None
 tree = None
-DB_PATH = "stocks.db"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # 此 .py 檔所在資料夾
+DB_PATH = os.path.join(BASE_DIR, "stocks.db")
+
+# Google 試算表相關常數（請依需求自行修改）
+SHEET_ID = '1u1opYwj_2bhOBhAM96CB7kYz9prWKQtXhmjU1cG15Dg'  # 試算表 ID
+SERVICE_ACCOUNT_FILE = os.path.join(BASE_DIR, 'service_account.json')  # Service Account 憑證
 
 # 全域狀態追蹤使用者選擇
 user_conflict_choice = None  # "skip" 或 "overwrite" 或 "cancel"
@@ -37,6 +51,30 @@ def init_db():
                         value REAL NOT NULL)''')
     conn.commit()
     conn.close()
+
+def get_latest_date_for_ticker(ticker: str):
+    """回傳資料庫中指定 ticker 的最新日期 (datetime.date)；若無資料回傳 None"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT MAX(date) FROM stock_data WHERE ticker=?", (ticker,))
+    row = cur.fetchone()
+    conn.close()
+    if row and row[0]:
+        return pd.to_datetime(row[0]).date()
+    return None
+
+
+def insert_data(ticker: str, date_str: str, label: str, value: float):
+    """將一筆資料寫入資料庫，如已存在就覆蓋"""
+    global inserted_count
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""INSERT OR REPLACE INTO stock_data (ticker, date, label, value)
+                   VALUES (?,?,?,?)""",
+                (ticker, date_str, label, value))
+    conn.commit()
+    conn.close()
+    inserted_count += 1
 
 # 自訂彈出視窗讓使用者選擇如何處理重複資料
 def ask_conflict_resolution(ticker, date, label):
@@ -192,32 +230,23 @@ def bulk_import():
         refresh_table()
         messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
 
-def import_from_excel():
+# --- 處理 Excel 匯入邏輯 ---
+def process_excel(file_path):
     global user_conflict_choice, apply_to_all, cancel_import, inserted_count
     user_conflict_choice = None
     apply_to_all = False
     cancel_import = False
     inserted_count = 0
-
-    file_path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx *.xls")])
-    if not file_path:
-        return
-
     try:
         xls = pd.ExcelFile(file_path)
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet_name)
-            # 如果沒有 Date 欄，就跳過這個 sheet
             if 'Date' not in df.columns:
                 continue
-
-            # 逐列匯入
             for _, row in df.iterrows():
                 if cancel_import:
                     messagebox.showinfo("已取消", f"成功寫入 {inserted_count} 筆資料。")
-                    return
-
-                # 取出日期，轉成 YYYY-MM-DD 字串
+                    return False
                 date_val = row['Date']
                 # 新增：若日期欄為空，則使用今天日期
                 if pd.isna(date_val) or (isinstance(date_val, str) and date_val.strip() == ""):
@@ -236,17 +265,141 @@ def import_from_excel():
                     if col == 'Date':
                         continue
                     value = row[col]
-                    # 跳過空值
                     if pd.isna(value):
                         continue
                     insert_data(sheet_name, date_str, col, value)
+        return True
+    except Exception as e:
+        messagebox.showerror("匯入錯誤", str(e))
+        return False
+    
+def import_from_excel():
+    file_path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx *.xls")])
+    if not file_path:
+        return
+    if process_excel(file_path):
+        populate_ticker_dropdown()
+        refresh_table()
+        messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
 
-        if not cancel_import:
+def auto_import_from_google():
+    """
+    程式啟動後第一次執行：
+       1. 讀取 Google 試算表所有工作表 (每張表名視為一個 ticker)
+       2. 逐張表比較資料庫「該 ticker 的最新日期」
+       3. 若資料庫無該 ticker，匯入全部；否則僅匯入 >= 最新日期 之後的資料
+       4. 如有重複自動覆蓋（不彈出衝突對話框）
+    """
+    global user_conflict_choice, apply_to_all, cancel_import, inserted_count
+
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        print("⚠️  未找到 service_account.json，已跳過自動匯入")
+        return
+
+    try:
+        # 連線 Google Sheets
+        scope = ['https://spreadsheets.google.com/feeds',
+                 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_name(
+            SERVICE_ACCOUNT_FILE, scope)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(SHEET_ID)
+
+        # 預設覆蓋衝突
+        user_conflict_choice = "overwrite"
+        apply_to_all = True
+        cancel_import = False
+        inserted_count = 0
+
+        for ws in spreadsheet.worksheets():
+            ticker = ws.title.strip()
+            latest_date = get_latest_date_for_ticker(ticker)
+            df = pd.DataFrame(ws.get_all_records())
+
+            # 跳過沒有 Date 欄位的工作表
+            if 'Date' not in df.columns:
+                continue
+
+            for _, row in df.iterrows():
+                date_val = row['Date']
+                if pd.isna(date_val) or (isinstance(date_val, str) and date_val.strip() == ""):
+                    date_obj = pd.to_datetime(calendar_date.entry.get()).date()
+                else:
+                    try:
+                        date_obj = pd.to_datetime(date_val).date()
+                    except Exception:
+                        continue
+
+                # 若資料庫已有紀錄，只匯入 >= latest_date 的資料
+                if latest_date and date_obj < latest_date:
+                    continue
+
+                date_str = str(date_obj)
+
+                for col in df.columns:
+                    if col == 'Date':
+                        continue
+                    value = row[col]
+                    if pd.isna(value):
+                        continue
+                    insert_data(ticker, date_str, col, value)
+
+        if inserted_count:
+            populate_ticker_dropdown(),
+            refresh_table()
+
+            messagebox.showinfo("已從 google sheet 更新完成", f"成功寫入 {inserted_count} 筆資料。")
+            print(f"✅ 自動匯入完成，共寫入 {inserted_count} 筆資料")
+        else:
+            print("ℹ️  自動匯入：無新資料")
+
+    except APIError as e:
+        messagebox.showerror("API 錯誤", f"Google Sheets API 尚未啟用：\n{e.response.text}")
+    except PermissionError as e:
+        cause = e.__cause__ or e
+        messagebox.showerror("授權錯誤", f"服務帳戶無權存取試算表：\n{cause}")
+    except Exception as e:
+        err = traceback.format_exc()
+        messagebox.showerror("自動匯入錯誤", f"詳細錯誤:\n{err}")
+
+# --- 從 Google 試算表匯入（使用 Service Account 認證） ---
+def import_from_google():
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        print("⚠️  未找到 service_account.json，已取消匯入")
+        return
+
+    try:
+        # 連線 Google Sheets
+        scope = ['https://spreadsheets.google.com/feeds',
+                 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_name(
+            SERVICE_ACCOUNT_FILE, scope)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(SHEET_ID)
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+            with pd.ExcelWriter(tmp.name, engine="xlsxwriter") as writer:
+                for ws in spreadsheet.worksheets():
+                    df = pd.DataFrame(ws.get_all_records())
+                    safe_title = re.sub(r'[\\/?*:|<>]', '_', ws.title)[:31]
+                    df.to_excel(writer, index=False, sheet_name=safe_title)
+
+            tmp_path = tmp.name            
+
+        if process_excel(tmp_path):
+
             populate_ticker_dropdown()
             refresh_table()
             messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
+
+    except APIError as e:
+        messagebox.showerror("API 錯誤", f"Google Sheets API 尚未啟用：\n{e.response.text}")
+    except PermissionError as e:
+        cause = e.__cause__ or e
+        messagebox.showerror("授權錯誤", f"服務帳戶無權存取試算表：\n{cause}")
     except Exception as e:
-        messagebox.showerror("匯入錯誤", str(e))
+        err = traceback.format_exc()
+        messagebox.showerror("匯入錯誤", f"詳細錯誤:\n{err}")
 
 def fetch_data(filter_ticker="", start_date=None, end_date=None):
     conn = sqlite3.connect(DB_PATH)
@@ -387,6 +540,8 @@ def update_ohlc(selected_date_input):
             for label, value in ohlc.items():
                 insert_data(t, str(date), label, value)
             count += 1
+
+        refresh_table()
 
         messagebox.showinfo("更新完成", f"已成功為 {count} 支 ticker 更新 {date} 的 OHLC 資料。")
     except Exception as e:
@@ -534,6 +689,8 @@ def build_gui():
     import_menu["menu"] = menu
     menu.add_command(label="從 TXT 匯入", command=bulk_import)
     menu.add_command(label="從 Excel 匯入", command=import_from_excel)
+    menu.add_command(label="從 Google 試算表匯入", command=import_from_google)
+    ttk.Button(main, text="從 Google sheet 更新最新 data", bootstyle=SUCCESS, command=auto_import_from_google).grid(row=0, column=1, sticky=W, pady=5)
 
     entry_frame = ttk.LabelFrame(main, text="單筆輸入", padding=10)
     entry_frame.grid(row=1, column=0, columnspan=2, sticky=W+E, pady=10)
@@ -614,6 +771,7 @@ def build_gui():
 
     populate_ticker_dropdown()
     refresh_table()
+
     root.mainloop()
 
 if __name__ == "__main__":
