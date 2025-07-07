@@ -1,13 +1,21 @@
 import sqlite3
+import tempfile
 import tkinter as tk
 from tkinter import messagebox, filedialog
+import traceback
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import yfinance as yf
 import re
 import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from ttkbootstrap.widgets import DateEntry
+from gspread.exceptions import APIError
+
+# 如果需要從 Google Sheet 讀取私有試算表，請安裝 gspread 與 oauth2client
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 
 # 全域控件
 root = None
@@ -192,54 +200,76 @@ def bulk_import():
         refresh_table()
         messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
 
-def import_from_excel():
+# --- 處理 Excel 匯入邏輯 ---
+def process_excel(file_path):
     global user_conflict_choice, apply_to_all, cancel_import, inserted_count
     user_conflict_choice = None
     apply_to_all = False
     cancel_import = False
     inserted_count = 0
-
-    file_path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx *.xls")])
-    if not file_path:
-        return
-
     try:
         xls = pd.ExcelFile(file_path)
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet_name)
-            # 如果沒有 Date 欄，就跳過這個 sheet
             if 'Date' not in df.columns:
                 continue
-
-            # 逐列匯入
             for _, row in df.iterrows():
                 if cancel_import:
                     messagebox.showinfo("已取消", f"成功寫入 {inserted_count} 筆資料。")
-                    return
-
-                # 取出日期，轉成 YYYY-MM-DD 字串
+                    return False
                 date_val = row['Date']
                 try:
                     date_str = str(pd.to_datetime(date_val).date())
                 except:
                     date_str = str(date_val)
-
-                # 其他所有欄位都當作 label 列出
                 for col in df.columns:
                     if col == 'Date':
                         continue
                     value = row[col]
-                    # 跳過空值
                     if pd.isna(value):
                         continue
                     insert_data(sheet_name, date_str, col, value)
-
-        if not cancel_import:
-            populate_ticker_dropdown()
-            refresh_table()
-            messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
+        return True
     except Exception as e:
         messagebox.showerror("匯入錯誤", str(e))
+        return False
+    
+def import_from_excel():
+    file_path = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx *.xls")])
+    if not file_path:
+        return
+    if process_excel(file_path):
+        populate_ticker_dropdown()
+        refresh_table()
+        messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
+
+# --- 從 Google 試算表匯入（使用 Service Account 認證） ---
+def import_from_google():
+    creds_file = filedialog.askopenfilename(title="選擇 Service Account JSON", filetypes=[("JSON", "*.json")])
+    if not creds_file: return
+    SHEET_ID, GID = '1u1opYwj_2bhOBhAM96CB7kYz9prWKQtXhmjU1cG15Dg', '1369484985'
+    try:
+        scope = ['https://spreadsheets.google.com/feeds','https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_name(creds_file, scope)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open_by_key(SHEET_ID)
+        sheet = next((ws for ws in spreadsheet.worksheets() if str(ws.id)==GID), None)
+        if sheet is None: raise Exception("找不到指定工作表")
+        df = pd.DataFrame(sheet.get_all_records())
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+            df.to_excel(tmp.name, index=False, sheet_name='GoogleSheet')
+            tmp_path = tmp.name
+        if not process_excel(tmp_path): raise Exception("Google 試算表匯入失敗")
+        populate_ticker_dropdown(); refresh_table()
+        messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
+    except APIError as e:
+        messagebox.showerror("API 錯誤", f"Google Sheets API 尚未啟用：\n{e.response.text}")
+    except PermissionError as e:
+        cause = e.__cause__ or e
+        messagebox.showerror("授權錯誤", f"服務帳戶無權存取試算表：\n{cause}")
+    except Exception as e:
+        err = traceback.format_exc()
+        messagebox.showerror("匯入錯誤", f"詳細錯誤:\n{err}")
 
 def fetch_data(filter_ticker="", start_date=None, end_date=None):
     conn = sqlite3.connect(DB_PATH)
@@ -475,6 +505,7 @@ def build_gui():
     import_menu["menu"] = menu
     menu.add_command(label="從 TXT 匯入", command=bulk_import)
     menu.add_command(label="從 Excel 匯入", command=import_from_excel)
+    menu.add_command(label="從 Google 試算表匯入", command=import_from_google)
 
     entry_frame = ttk.LabelFrame(main, text="單筆輸入", padding=10)
     entry_frame.grid(row=1, column=0, columnspan=2, sticky=W+E, pady=10)
