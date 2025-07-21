@@ -407,6 +407,55 @@ def fetch_historical_ohlc_from_db(ticker):
     pivot = df.pivot(index='date', columns='label', values='value')
     return pivot.sort_index()
 
+# --- 新增函式：依篩選條件的 ticker & 日期區間，批次更新每天的 OHLC ---
+def update_ohlc_range():
+    try:
+        t = ticker_filter.get().strip()
+        start = start_date_filter.entry.get().strip()
+        end = end_date_filter.entry.get().strip()
+        if not t or not start or not end:
+            messagebox.showwarning("參數不足", "請先選擇 Ticker 及起始/結束日期")
+            return
+
+        # 下載期間內的日線資料
+        yf_ticker = f"^{t}" if t in ["SPX","NDX","VIX"] else t
+        df = yf.download(
+            tickers=yf_ticker,
+            start=start,
+            end=pd.to_datetime(end) + pd.Timedelta(days=1),
+            interval="1d",
+            group_by="ticker",
+            progress=False,
+            auto_adjust=False
+        )
+
+        if df.empty:
+            messagebox.showinfo("無資料", f"{t} 在 {start} 到 {end} 期間無任何日線資料")
+            return
+
+        # 單 ticker 可能回傳單層 DataFrame
+        data = df if not isinstance(df.columns, pd.MultiIndex) else df[yf_ticker]
+
+        updated = 0
+        for idx, row in data.iterrows():
+            date_str = idx.date().isoformat()
+            ohlc = {
+                'Open': float(row['Open']),
+                'High': float(row['High']),
+                'Low':  float(row['Low']),
+                'Close':float(row['Close'])
+            }
+            # 刪除舊資料、寫入新資料
+            delete_ohlc(t, date_str)
+            for lbl, val in ohlc.items():
+                insert_data(t, date_str, lbl, val)
+            updated += 1
+
+        refresh_table()
+        messagebox.showinfo("更新完成", f"{t} 共更新 {updated} 天的 OHLC 資料 ({start} ~ {end})")
+    except Exception as e:
+        messagebox.showerror("更新失敗", str(e))
+
 def plot_graph():
     selected_ticker = ticker_filter.get()
     if not selected_ticker:
@@ -439,20 +488,23 @@ def plot_graph():
         ))
 
     # 從資料庫取得資料
+    # 讀取 OHLC；若缺資料僅警告，不中斷
     ohlc_df = fetch_historical_ohlc_from_db(selected_ticker)
-    if ohlc_df.empty or any(col not in ohlc_df.columns for col in ['Open','High','Low','Close']):
-        messagebox.showwarning("缺少資料", f"{selected_ticker} 沒有任何完整的 OHLC 歷史資料。")
-        return
-    
-    # 繪製 OHLC 圖表
-    fig.add_trace(go.Candlestick(
-        x=ohlc_df.index,
-        open=ohlc_df["Open"],
-        high=ohlc_df["High"],
-        low=ohlc_df["Low"],
-        close=ohlc_df["Close"],
-        name=selected_ticker + ' OHLC'
-    ))
+    has_ohlc = (not ohlc_df.empty) and all(col in ohlc_df.columns
+                                           for col in ['Open', 'High', 'Low', 'Close'])
+    if not has_ohlc:
+        messagebox.showwarning("缺少 OHLC",
+                               f"{selected_ticker} 無 OHLC 資料，圖表將僅顯示其他指標")
+    else:
+        # 繪製 OHLC
+        fig.add_trace(go.Candlestick(
+            x=ohlc_df.index,
+            open=ohlc_df["Open"],
+            high=ohlc_df["High"],
+            low=ohlc_df["Low"],
+            close=ohlc_df["Close"],
+            name=f"{selected_ticker} OHLC"
+        ))
 
     # 設置標題和軸標籤
     fig.update_layout(
@@ -494,7 +546,7 @@ def build_gui():
     gex_entry.grid(row=1, column=1, padx=5, sticky=W)
 
     ttk.Button(entry_frame, text="新增記錄", bootstyle=SUCCESS, command=single_entry).grid(row=2, column=1, sticky=W, pady=5)
-    btn_update_ohlc = tk.Button(entry_frame, text="更新 OHLC", command=lambda: update_ohlc(calendar_date))
+    btn_update_ohlc = tk.Button(entry_frame, text="更新當日 OHLC", command=lambda: update_ohlc(calendar_date))
     btn_update_ohlc.grid(row=2, column=1, padx=5, pady=5)
 
     filter_frame = ttk.LabelFrame(main, text="篩選條件", padding=10)
@@ -515,7 +567,10 @@ def build_gui():
     end_date_filter.grid(row=2, column=1, padx=5, sticky=W)
 
     ttk.Button(filter_frame, text="篩選", bootstyle=INFO, command=refresh_table).grid(row=3, column=1, sticky=W, pady=5)
-    ttk.Button(filter_frame, text="重置", bootstyle=SECONDARY, command=lambda: [ticker_filter.set(""), start_date_filter.entry.delete(0, 'end'), end_date_filter.entry.delete(0, 'end'), refresh_table()]).grid(row=3, column=1, sticky=E, pady=5)
+    # 新增：依篩選條件批次更新 OHLC
+    ttk.Button(filter_frame, text="更新 OHLC 區間", bootstyle=WARNING,
+               command=update_ohlc_range).grid(row=3, column=1, padx=100, sticky=W, pady=5)
+    ttk.Button(filter_frame, text="重置", bootstyle=DANGER, command=lambda: [ticker_filter.set(""), start_date_filter.entry.delete(0, 'end'), end_date_filter.entry.delete(0, 'end'), refresh_table()]).grid(row=3, column=1, padx=320, sticky=W, pady=5)
 
     table_frame = ttk.LabelFrame(main, text="資料表格", padding=10)
     table_frame.grid(row=3, column=0, columnspan=2, sticky=NSEW, pady=10)
