@@ -546,7 +546,7 @@ def build_gui():
     gex_entry.grid(row=1, column=1, padx=5, sticky=W)
 
     ttk.Button(entry_frame, text="新增記錄", bootstyle=SUCCESS, command=single_entry).grid(row=2, column=1, sticky=W, pady=5)
-    btn_update_ohlc = tk.Button(entry_frame, text="更新當日 OHLC", command=lambda: update_ohlc(calendar_date))
+    btn_update_ohlc = ttk.Button(entry_frame, text="更新當日 OHLC", bootstyle=WARNING, command=lambda: update_ohlc(calendar_date))
     btn_update_ohlc.grid(row=2, column=1, padx=5, pady=5)
 
     filter_frame = ttk.LabelFrame(main, text="篩選條件", padding=10)
