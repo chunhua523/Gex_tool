@@ -738,6 +738,9 @@ def build_gui():
     tree.heading("Value", text="Value")
     tree.pack(side=LEFT, fill=BOTH, expand=True)
 
+    # 在 tree.pack() 之後，先確保 Treeview 有焦點
+    tree.bind('<Button-1>', lambda e: tree.focus_set())
+
     def copy_selected_values(event=None):
         sel = tree.selection()
         if not sel:
@@ -751,9 +754,10 @@ def build_gui():
         # 若要顯示提示可取消下行
         # messagebox.showinfo("複製完成", f"已複製 {len(vals)} 筆 Value")
     
-    # 綁定 Ctrl+C（Windows/Linux）與 Command+C（macOS）
-    tree.bind('<Control-c>', copy_selected_values)
-    tree.bind('<Command-c>', copy_selected_values)
+    root.bind_all('<Command-c>', copy_selected_values)
+    root.bind_all('<Command-C>', copy_selected_values)
+    root.bind_all('<Control-c>', copy_selected_values)
+    root.bind_all('<Control-C>', copy_selected_values)
 
     scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=scrollbar.set)
