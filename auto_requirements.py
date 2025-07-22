@@ -28,7 +28,7 @@ def ensure_one(pkg: str, min_ver: str):
         print(f"{pkg} 未安裝，安裝中…")
 
     subprocess.check_call([sys.executable, "-m", "pip",
-                           "install", f"{pkg}>={min_ver}"])
+                           "install", f"{pkg}>={min_ver}", "--break-system-packages"])
 
 def ensure_requirements():
     for pkg, ver in REQUIRED.items():
