@@ -1,3 +1,5 @@
+import datetime
+import typing
 import auto_requirements
 auto_requirements.ensure_requirements()
 
@@ -154,17 +156,31 @@ def insert_data(ticker, date, label, value):
     conn.close()
 
 # --- 功能函式 ---
-def parse_gex_code(date, gex_code):
+def parse_gex_code(orig_date: str, gex_code: str) -> typing.Optional[str]:
+    """
+    解析 GEX TV Code 並寫入資料庫
+    - 若 TV Code 自帶日期，優先使用
+    - 解析前就先把 TV Code 原文存進資料庫（label = 'TV Code'）
+    """
     global cancel_import
     if cancel_import:
         return None
 
-    date = date.split(" ")[0]
-    match = re.match(r"(\w+):\s*(.*)", gex_code)
-    if not match:
-        messagebox.showwarning("格式錯誤", "無法解析 GEX TV Code")
+    # 內嵌日期 > Date 欄
+    embedded = _extract_date_from_tv_code(gex_code)
+    date_str = embedded.isoformat() if embedded else orig_date.split(" ")[0]
+
+    # 取 ticker（第一個 XXX:）
+    m = re.search(r"([A-Za-z]+):", gex_code)
+    if not m:
+        messagebox.showwarning("格式錯誤", f"無法解析 GEX TV Code：{gex_code}")
         return None
-    ticker, code_body = match.groups()
+    ticker = m.group(1).upper()
+
+    # 👉 **先把原文存進去，之後任何匯入方式都不用再管**
+    insert_data(ticker, date_str, "TV Code", gex_code.strip())
+
+    code_body = gex_code[m.end():].strip()
     elements = re.split(r',\s*', code_body)
     i = 0
     while i < len(elements) - 1:
@@ -172,14 +188,13 @@ def parse_gex_code(date, gex_code):
         try:
             value = float(elements[i + 1].strip())
             for label in labels.split('&'):
-                insert_data(ticker, date, label.strip(), value)
+                insert_data(ticker, date_str, label.strip(), value)
                 if cancel_import:
                     return None
             i += 2
         except ValueError:
             i += 1
     return ticker
-
 
 def single_entry():
     global user_conflict_choice, apply_to_all, cancel_import, inserted_count
@@ -230,6 +245,52 @@ def bulk_import():
         refresh_table()
         messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
 
+# 共用的小工具
+def _parse_date(val) -> typing.Optional[datetime.date]:
+    """將任何輸入轉成 datetime.date；轉換失敗回傳 None"""
+    ts = pd.to_datetime(val, errors="coerce")
+    return ts.date() if pd.notna(ts) else None
+
+# --- 工具函式 ------------------------------------------------------------
+def _extract_date_from_tv_code(tv_code: str) -> typing.Optional[datetime.date]:
+    """
+    若 TV Code 為「TICKER YYYYMMDD hhmmss TICKER: …」格式，
+    取出中間的 YYYYMMDD 為日期；否則回傳 None
+    """
+    m = re.match(r'^[A-Za-z]+\s+(\d{8})\b', tv_code)
+    if m:
+        return pd.to_datetime(m.group(1), format='%Y%m%d').date()
+    return None
+
+# 先集中定義允許匯入的欄位
+# ALLOWED_COLS = ['Open', 'High', 'Low', 'Close', 'TV Code']
+ALLOWED_COLS = ['TV Code']
+
+def _import_rows(ticker: str, df: pd.DataFrame, latest_date=None):
+    """
+    1. 每一列只看 TV Code 欄  
+    2. 日期優先順序：TV Code 內嵌 > Date 欄  
+    3. latest_date 仍用來過濾（以最終決定的日期比較）
+    """
+    if 'TV Code' not in df.columns:
+        return
+
+    for _, row in df.iterrows():
+        tv_code = str(row['TV Code']).strip()
+        if not tv_code or tv_code.lower() == 'nan':
+            continue
+
+        # 先判斷日期
+        date_obj = _extract_date_from_tv_code(tv_code)
+        if date_obj is None:                       # 沒嵌日期 → 用 Date 欄
+            date_obj = _parse_date(row.get('Date'))
+        if date_obj is None:
+            continue
+        if latest_date and date_obj <= latest_date:
+            continue
+
+        parse_gex_code(date_obj.isoformat(), tv_code)
+
 # --- 處理 Excel 匯入邏輯 ---
 def process_excel(file_path):
     global user_conflict_choice, apply_to_all, cancel_import, inserted_count
@@ -241,33 +302,7 @@ def process_excel(file_path):
         xls = pd.ExcelFile(file_path)
         for sheet_name in xls.sheet_names:
             df = pd.read_excel(xls, sheet_name=sheet_name)
-            if 'Date' not in df.columns:
-                continue
-            for _, row in df.iterrows():
-                if cancel_import:
-                    messagebox.showinfo("已取消", f"成功寫入 {inserted_count} 筆資料。")
-                    return False
-                date_val = row['Date']
-                # 新增：若日期欄為空，則使用今天日期
-                if pd.isna(date_val) or (isinstance(date_val, str) and date_val.strip() == ""):
-                    date_obj = calendar_date.entry.get()
-                else:
-                    try:
-                        date_obj = pd.to_datetime(date_val).date()
-                    except Exception:
-                        # 若無法轉換為 datetime，就原樣取出
-                        date_obj = date_val
-
-                date_str = str(date_obj)
-
-                # 其他所有欄位都當作 label 列出
-                for col in df.columns:
-                    if col == 'Date':
-                        continue
-                    value = row[col]
-                    if pd.isna(value):
-                        continue
-                    insert_data(sheet_name, date_str, col, value)
+            _import_rows(sheet_name.strip(), df)          # ⬅️ 共用
         return True
     except Exception as e:
         messagebox.showerror("匯入錯誤", str(e))
@@ -284,20 +319,18 @@ def import_from_excel():
 
 def auto_import_from_google():
     """
-    程式啟動後第一次執行：
-       1. 讀取 Google 試算表所有工作表 (每張表名視為一個 ticker)
-       2. 逐張表比較資料庫「該 ticker 的最新日期」
-       3. 若資料庫無該 ticker，匯入全部；否則僅匯入 >= 最新日期 之後的資料
-       4. 如有重複自動覆蓋（不彈出衝突對話框）
+    1. 讀取試算表所有工作表
+    2. 僅匯入 Open/High/Low/Close/TV Code
+    3. 針對各 ticker 只匯入 >= 資料庫最新日期 之後的資料
+       （latest_date 透過 _import_rows 的 latest_date 參數過濾）
     """
     global user_conflict_choice, apply_to_all, cancel_import, inserted_count
-
     if not os.path.exists(SERVICE_ACCOUNT_FILE):
         print("⚠️  未找到 service_account.json，已跳過自動匯入")
         return
 
     try:
-        # 連線 Google Sheets
+        # 建立 Google Sheets 連線（程式其餘部分保持原樣）:contentReference[oaicite:1]{index=1}
         scope = ['https://spreadsheets.google.com/feeds',
                  'https://www.googleapis.com/auth/drive']
         creds = ServiceAccountCredentials.from_json_keyfile_name(
@@ -305,7 +338,7 @@ def auto_import_from_google():
         client = gspread.authorize(creds)
         spreadsheet = client.open_by_key(SHEET_ID)
 
-        # 預設覆蓋衝突
+        # 覆蓋模式、重置計數
         user_conflict_choice = "overwrite"
         apply_to_all = True
         cancel_import = False
@@ -313,51 +346,17 @@ def auto_import_from_google():
 
         for ws in spreadsheet.worksheets():
             ticker = ws.title.strip()
-            latest_date = get_latest_date_for_ticker(ticker)
+            latest_date = get_latest_date_for_ticker(ticker)  # 可能為 None
             df = pd.DataFrame(ws.get_all_records())
-
-            # 跳過沒有 Date 欄位的工作表
-            if 'Date' not in df.columns:
-                continue
-
-            for _, row in df.iterrows():
-                date_val = row['Date']
-                if pd.isna(date_val) or (isinstance(date_val, str) and date_val.strip() == ""):
-                    date_obj = pd.to_datetime(calendar_date.entry.get()).date()
-                else:
-                    try:
-                        date_obj = pd.to_datetime(date_val).date()
-                    except Exception:
-                        continue
-
-                # 若資料庫已有紀錄，只匯入 >= latest_date 的資料
-                if latest_date and date_obj < latest_date:
-                    continue
-
-                date_str = str(date_obj)
-
-                for col in df.columns:
-                    if col == 'Date':
-                        continue
-                    value = row[col]
-                    if pd.isna(value):
-                        continue
-                    insert_data(ticker, date_str, col, value)
+            _import_rows(ticker, df, latest_date)             # ⬅️ 共用
 
         if inserted_count:
-            populate_ticker_dropdown(),
+            populate_ticker_dropdown()
             refresh_table()
-
-            messagebox.showinfo("已從 google sheet 更新完成", f"成功寫入 {inserted_count} 筆資料。")
+            messagebox.showinfo("已從 Google Sheet 更新完成", f"成功寫入 {inserted_count} 筆資料。")
             print(f"✅ 自動匯入完成，共寫入 {inserted_count} 筆資料")
         else:
             print("ℹ️  自動匯入：無新資料")
-
-    except APIError as e:
-        messagebox.showerror("API 錯誤", f"Google Sheets API 尚未啟用：\n{e.response.text}")
-    except PermissionError as e:
-        cause = e.__cause__ or e
-        messagebox.showerror("授權錯誤", f"服務帳戶無權存取試算表：\n{cause}")
     except Exception as e:
         err = traceback.format_exc()
         messagebox.showerror("自動匯入錯誤", f"詳細錯誤:\n{err}")
@@ -627,20 +626,35 @@ def plot_graph():
 
     fig = go.Figure()
 
-    # 要排除不畫出的資料
-    exclude_labels = ['Open', 'High', 'Low', 'Close', 'Flip %', 'TV Code']
+    color_map = {
+        'Call Dominate':  '#FFD700',
+        'Call Wall':      '#FFA500',
+        'Call Wall CE':   '#FF7F50',
+        'Gamma Field':    "#D75BF6",
+        'Gamma Field CE': "#EAA1F8",
+        'Key Delta':      '#ADFF2F',
+        'Gamma Flip':     "#CBCBCB",
+        'Gamma Flip CE':  "#FFFFFF",
+        'Put Wall CE':    '#FF1493',
+        'Put Wall':       '#DC143C',
+        'Put Dominate':   '#8B0000',
+    }
+
+    labels = list(color_map.keys())   # ❷ 用 color_map 的 key 當繪圖順序
 
     # 繪製 GEX 折線圖（排除指定 labels）
-    for label in df["label"].unique():
-        if label in exclude_labels:
-            continue
-        subset = df[df["label"] == label]
-        fig.add_trace(go.Scatter(
-            x=subset["date"],
-            y=subset["value"],
-            mode="lines+markers",
-            name=label
-        ))
+    for label in labels:
+        # if label in exclude_labels:
+        #     continue
+        if label in df["label"].unique():
+            subset = df[df["label"] == label]
+            fig.add_trace(go.Scatter(
+                x=subset["date"],
+                y=subset["value"],
+                mode="lines+markers",
+                name=label,
+                line=dict(color=color_map[label]),   # ← 指定線色
+            ))
 
     # 從資料庫取得資料
     # 讀取 OHLC；若缺資料僅警告，不中斷
