@@ -286,7 +286,7 @@ def _import_rows(ticker: str, df: pd.DataFrame, latest_date=None):
             date_obj = _parse_date(row.get('Date'))
         if date_obj is None:
             continue
-        if latest_date and date_obj <= latest_date:
+        if latest_date and date_obj < latest_date:
             continue
 
         parse_gex_code(date_obj.isoformat(), tv_code)
@@ -339,8 +339,8 @@ def auto_import_from_google():
         spreadsheet = client.open_by_key(SHEET_ID)
 
         # 覆蓋模式、重置計數
-        user_conflict_choice = "overwrite"
-        apply_to_all = True
+        user_conflict_choice = None
+        apply_to_all = False
         cancel_import = False
         inserted_count = 0
 
@@ -356,6 +356,7 @@ def auto_import_from_google():
             messagebox.showinfo("已從 Google Sheet 更新完成", f"成功寫入 {inserted_count} 筆資料。")
             print(f"✅ 自動匯入完成，共寫入 {inserted_count} 筆資料")
         else:
+            messagebox.showinfo("完成", "無新資料")
             print("ℹ️  自動匯入：無新資料")
     except Exception as e:
         err = traceback.format_exc()
