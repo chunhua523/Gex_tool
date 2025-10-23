@@ -347,7 +347,33 @@ def auto_import_from_google():
         for ws in spreadsheet.worksheets():
             ticker = ws.title.strip()
             latest_date = get_latest_date_for_ticker(ticker)  # 可能為 None
-            df = pd.DataFrame(ws.get_all_records())
+            
+            try:
+                # 使用 get_all_values() 獲取所有數據，然後手動處理標題
+                all_values = ws.get_all_values()
+                if not all_values:
+                    print(f"⚠️  工作表 '{ticker}' 為空，跳過")
+                    continue
+                
+                # 第一行作為標題
+                headers = all_values[0]
+                # 檢查標題是否有效
+                if not headers or all(not h.strip() for h in headers):
+                    print(f"⚠️  工作表 '{ticker}' 標題行為空，跳過")
+                    continue
+                
+                # 創建DataFrame，處理可能的標題重複
+                df = pd.DataFrame(all_values[1:], columns=headers)
+                
+            except Exception as sheet_error:
+                print(f"⚠️  工作表 '{ticker}' 讀取失敗，跳過：{str(sheet_error)}")
+                continue
+            
+            # 檢查是否有必要的欄位
+            if 'TV Code' not in df.columns:
+                print(f"⚠️  工作表 '{ticker}' 缺少 'TV Code' 欄位，跳過")
+                continue
+                
             _import_rows(ticker, df, latest_date)             # ⬅️ 共用
 
         if inserted_count:
