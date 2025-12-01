@@ -33,6 +33,7 @@ DB_PATH = os.path.join(BASE_DIR, "stocks.db")
 
 # Google 試算表相關常數（請依需求自行修改）
 SHEET_ID = '1u1opYwj_2bhOBhAM96CB7kYz9prWKQtXhmjU1cG15Dg'  # 試算表 ID
+SHEET_ID_MINOR = '1H7MqEuVuu_xIN9B-rFMrevDLeaCn06z3dn0XBMt_-to'  # 試算表 ID
 SERVICE_ACCOUNT_FILE = os.path.join(BASE_DIR, 'service_account.json')  # Service Account 憑證
 
 # 全域狀態追蹤使用者選擇
@@ -40,6 +41,7 @@ user_conflict_choice = None  # "skip" 或 "overwrite" 或 "cancel"
 apply_to_all = False
 cancel_import = False
 inserted_count = 0
+all_tickers = []
 
 # --- 資料庫相關 ---
 def init_db():
@@ -171,7 +173,7 @@ def parse_gex_code(orig_date: str, gex_code: str) -> typing.Optional[str]:
     date_str = embedded.isoformat() if embedded else orig_date.split(" ")[0]
 
     # 取 ticker（第一個 XXX:）
-    m = re.search(r"([A-Za-z]+):", gex_code)
+    m = re.search(r"([A-Za-z\.]+):", gex_code)
     if not m:
         messagebox.showwarning("格式錯誤", f"無法解析 GEX TV Code：{gex_code}")
         return None
@@ -257,7 +259,7 @@ def _extract_date_from_tv_code(tv_code: str) -> typing.Optional[datetime.date]:
     若 TV Code 為「TICKER YYYYMMDD hhmmss TICKER: …」格式，
     取出中間的 YYYYMMDD 為日期；否則回傳 None
     """
-    m = re.match(r'^[A-Za-z]+\s+(\d{8})\b', tv_code)
+    m = re.match(r'^[A-Za-z\.]+\s+(\d{8})\b', tv_code)
     if m:
         return pd.to_datetime(m.group(1), format='%Y%m%d').date()
     return None
@@ -336,7 +338,6 @@ def auto_import_from_google():
         creds = ServiceAccountCredentials.from_json_keyfile_name(
             SERVICE_ACCOUNT_FILE, scope)
         client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(SHEET_ID)
 
         # 覆蓋模式、重置計數
         user_conflict_choice = None
@@ -344,37 +345,45 @@ def auto_import_from_google():
         cancel_import = False
         inserted_count = 0
 
-        for ws in spreadsheet.worksheets():
-            ticker = ws.title.strip()
-            latest_date = get_latest_date_for_ticker(ticker)  # 可能為 None
-            
+        sheet_ids = [SHEET_ID, SHEET_ID_MINOR]
+        for s_id in sheet_ids:
             try:
-                # 使用 get_all_values() 獲取所有數據，然後手動處理標題
-                all_values = ws.get_all_values()
-                if not all_values:
-                    print(f"⚠️  工作表 '{ticker}' 為空，跳過")
+                spreadsheet = client.open_by_key(s_id)
+            except Exception as e:
+                print(f"⚠️  無法開啟試算表 {s_id}: {e}")
+                continue
+
+            for ws in spreadsheet.worksheets():
+                ticker = ws.title.strip()
+                latest_date = get_latest_date_for_ticker(ticker)  # 可能為 None
+                
+                try:
+                    # 使用 get_all_values() 獲取所有數據，然後手動處理標題
+                    all_values = ws.get_all_values()
+                    if not all_values:
+                        print(f"⚠️  工作表 '{ticker}' 為空，跳過")
+                        continue
+                    
+                    # 第一行作為標題
+                    headers = all_values[0]
+                    # 檢查標題是否有效
+                    if not headers or all(not h.strip() for h in headers):
+                        print(f"⚠️  工作表 '{ticker}' 標題行為空，跳過")
+                        continue
+                    
+                    # 創建DataFrame，處理可能的標題重複
+                    df = pd.DataFrame(all_values[1:], columns=headers)
+                    
+                except Exception as sheet_error:
+                    print(f"⚠️  工作表 '{ticker}' 讀取失敗，跳過：{str(sheet_error)}")
                     continue
                 
-                # 第一行作為標題
-                headers = all_values[0]
-                # 檢查標題是否有效
-                if not headers or all(not h.strip() for h in headers):
-                    print(f"⚠️  工作表 '{ticker}' 標題行為空，跳過")
+                # 檢查是否有必要的欄位
+                if 'TV Code' not in df.columns:
+                    print(f"⚠️  工作表 '{ticker}' 缺少 'TV Code' 欄位，跳過")
                     continue
-                
-                # 創建DataFrame，處理可能的標題重複
-                df = pd.DataFrame(all_values[1:], columns=headers)
-                
-            except Exception as sheet_error:
-                print(f"⚠️  工作表 '{ticker}' 讀取失敗，跳過：{str(sheet_error)}")
-                continue
-            
-            # 檢查是否有必要的欄位
-            if 'TV Code' not in df.columns:
-                print(f"⚠️  工作表 '{ticker}' 缺少 'TV Code' 欄位，跳過")
-                continue
-                
-            _import_rows(ticker, df, latest_date)             # ⬅️ 共用
+                    
+                _import_rows(ticker, df, latest_date)             # ⬅️ 共用
 
         if inserted_count:
             populate_ticker_dropdown()
@@ -401,22 +410,33 @@ def import_from_google():
         creds = ServiceAccountCredentials.from_json_keyfile_name(
             SERVICE_ACCOUNT_FILE, scope)
         client = gspread.authorize(creds)
-        spreadsheet = client.open_by_key(SHEET_ID)
+        
+        # Initialize counters manually
+        global user_conflict_choice, apply_to_all, cancel_import, inserted_count
+        user_conflict_choice = None
+        apply_to_all = False
+        cancel_import = False
+        inserted_count = 0
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
-            with pd.ExcelWriter(tmp.name, engine="xlsxwriter") as writer:
+        sheet_ids = [SHEET_ID, SHEET_ID_MINOR]
+        
+        for s_id in sheet_ids:
+            try:
+                spreadsheet = client.open_by_key(s_id)
                 for ws in spreadsheet.worksheets():
-                    df = pd.DataFrame(ws.get_all_records())
-                    safe_title = re.sub(r'[\\/?*:|<>]', '_', ws.title)[:31]
-                    df.to_excel(writer, index=False, sheet_name=safe_title)
+                    try:
+                        records = ws.get_all_records()
+                        df = pd.DataFrame(records)
+                        _import_rows(ws.title.strip(), df)
+                    except Exception as inner_e:
+                        print(f"⚠️  工作表 '{ws.title}' 讀取失敗 (ID: {s_id})：{inner_e}")
+            except Exception as e:
+                print(f"⚠️  無法開啟試算表 {s_id}: {e}")
+                continue
 
-            tmp_path = tmp.name            
-
-        if process_excel(tmp_path):
-
-            populate_ticker_dropdown()
-            refresh_table()
-            messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
+        populate_ticker_dropdown()
+        refresh_table()
+        messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
 
     except APIError as e:
         messagebox.showerror("API 錯誤", f"Google Sheets API 尚未啟用：\n{e.response.text}")
@@ -476,14 +496,18 @@ def refresh_table():
 
 
 def populate_ticker_dropdown():
+    global all_tickers
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT DISTINCT ticker FROM stock_data")
-    tickers = [r[0] for r in cursor.fetchall()]
+    all_tickers = sorted([r[0] for r in cursor.fetchall()])
     conn.close()
-    if tickers:
-        ticker_filter['values'] = tickers
-        ticker_filter.set(tickers[0])
+    if all_tickers:
+        ticker_filter['values'] = all_tickers
+        # 如果當前有值且在列表中，保持不變；否則設為第一個
+        current = ticker_filter.get()
+        if not current and all_tickers:
+            ticker_filter.set(all_tickers[0])
 
 # 資料庫 helper：取得所有 ticker
 def get_all_tickers():
@@ -533,8 +557,16 @@ def update_ohlc(selected_date_input):
         next_day = date + pd.Timedelta(days=1)
 
         tickers = get_all_tickers()
-        # 根據 TV market 指數欄位前綴
-        ticker_names = [f"^{t}" if t in ["SPX","NDX","VIX"] else t for t in tickers]
+        # 根據 TV market 指數欄位前綴，並處理 BRK.B -> BRK-B
+        ticker_map = {}
+        ticker_names = []
+        for t in tickers:
+            if t in ["SPX", "NDX", "VIX"]:
+                yf_name = f"^{t}"
+            else:
+                yf_name = t.replace(".", "-")
+            ticker_names.append(yf_name)
+            ticker_map[t] = yf_name
 
         # 批次下載所有 ticker 的單日資料
         df = yf.download(
@@ -549,18 +581,31 @@ def update_ohlc(selected_date_input):
 
         count = 0
         for t in tickers:
-            name = f"^{t}" if t in ["SPX","NDX","VIX"] else t
+            name = ticker_map[t]
             # 若為多層索引，取該 ticker 區段，否則為單一 DataFrame
-            data = df[name] if isinstance(df.columns, pd.MultiIndex) else df
+            # 注意：若只下載一支股票，yfinance 可能不會回傳 MultiIndex，
+            # 但若 ticker_names 只有一個元素，df 就是那支股票的資料
+            if len(ticker_names) > 1 and isinstance(df.columns, pd.MultiIndex):
+                try:
+                    data = df[name]
+                except KeyError:
+                    continue
+            else:
+                data = df
+            
             if data.empty:
                 continue
-            row = data.iloc[0]
-            ohlc = {
-                'Open': float(row['Open']),
-                'High': float(row['High']),
-                'Low': float(row['Low']),
-                'Close': float(row['Close'])
-            }
+            try:
+                row = data.iloc[0]
+                ohlc = {
+                    'Open': float(row['Open']),
+                    'High': float(row['High']),
+                    'Low': float(row['Low']),
+                    'Close': float(row['Close'])
+                }
+            except (IndexError, ValueError, KeyError):
+                continue
+
             # 刪除舊資料後插入
             delete_ohlc(t, str(date))
             for label, value in ohlc.items():
@@ -599,7 +644,11 @@ def update_ohlc_range():
             return
 
         # 下載期間內的日線資料
-        yf_ticker = f"^{t}" if t in ["SPX","NDX","VIX"] else t
+        if t in ["SPX", "NDX", "VIX"]:
+            yf_ticker = f"^{t}"
+        else:
+            yf_ticker = t.replace(".", "-")
+
         df = yf.download(
             tickers=yf_ticker,
             start=start,
@@ -713,6 +762,56 @@ def plot_graph():
 
     fig.show()
 
+def on_ticker_type(event):
+    """當使用者在 Ticker Combobox 輸入時，動態篩選下拉選單內容"""
+    # 忽略導航鍵與功能鍵
+    if event.keysym in ['Up', 'Down', 'Left', 'Right', 'Return', 'Escape', 'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 'Alt_L', 'Alt_R']:
+        return
+
+    # 保存游標位置
+    try:
+        cursor_pos = ticker_filter.index(tk.INSERT)
+    except:
+        cursor_pos = len(ticker_filter.get())
+
+    current_text = ticker_filter.get()
+    
+    # 計算新的 values
+    if not current_text:
+        new_values = all_tickers
+    else:
+        # 簡單的子字串搜尋 (case-insensitive)
+        new_values = [t for t in all_tickers if current_text.lower() in t.lower()]
+    
+    # 檢查是否需要更新 (避免不必要的重繪)
+    current_values = []
+    try:
+        current_values = list(ticker_filter['values'])
+    except:
+        pass
+        
+    if new_values != current_values:
+        ticker_filter['values'] = new_values
+        
+        # 若有搜尋結果，嘗試展開選單
+        if new_values:
+            try:
+                ticker_filter.tk.call('ttk::combobox::Post', ticker_filter._w)
+            except:
+                pass
+        else:
+            try:
+                ticker_filter.tk.call('ttk::combobox::Unpost', ticker_filter._w)
+            except:
+                pass
+
+        # 立即還原游標位置並清除選取
+        try:
+            ticker_filter.selection_clear()
+            ticker_filter.icursor(cursor_pos)
+        except:
+            pass
+
 # --- GUI 建構 ---
 def build_gui():
     global root, calendar_date, gex_entry, ticker_filter, start_date_filter, end_date_filter, tree
@@ -751,8 +850,9 @@ def build_gui():
     filter_frame.grid(row=2, column=0, columnspan=2, sticky=W+E)
 
     ttk.Label(filter_frame, text="Ticker:").grid(row=0, column=0, sticky=E)
-    ticker_filter = ttk.Combobox(filter_frame, state="readonly")
+    ticker_filter = ttk.Combobox(filter_frame)
     ticker_filter.grid(row=0, column=1, padx=5, sticky=W)
+    ticker_filter.bind('<KeyRelease>', on_ticker_type)
 
     ttk.Label(filter_frame, text="起始日期:").grid(row=1, column=0, sticky=E)
     start_date_filter = DateEntry(filter_frame, bootstyle="dark", dateformat="%Y-%m-%d")
