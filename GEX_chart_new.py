@@ -762,55 +762,98 @@ def plot_graph():
 
     fig.show()
 
-def on_ticker_type(event):
-    """當使用者在 Ticker Combobox 輸入時，動態篩選下拉選單內容"""
-    # 忽略導航鍵與功能鍵
-    if event.keysym in ['Up', 'Down', 'Left', 'Right', 'Return', 'Escape', 'Tab', 'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 'Alt_L', 'Alt_R']:
-        return
+# --- 自定義 Combobox 類別 ---
+class SearchCombobox(ttk.Combobox):
+    def __init__(self, master=None, **kwargs):
+        super().__init__(master, **kwargs)
+        self.bind('<KeyRelease>', self.on_keyrelease)
+        self.bind('<FocusOut>', self.on_focusout)
+        self.bind('<Return>', self.on_return)
+        self._listbox_window = None
+        self._listbox = None
 
-    # 保存游標位置
-    try:
-        cursor_pos = ticker_filter.index(tk.INSERT)
-    except:
-        cursor_pos = len(ticker_filter.get())
+    def on_keyrelease(self, event):
+        # 忽略導航鍵與功能鍵
+        if event.keysym in ['Up', 'Down', 'Left', 'Right', 'Return', 'Escape', 'Tab', 
+                            'Shift_L', 'Shift_R', 'Control_L', 'Control_R', 'Alt_L', 'Alt_R']:
+            return
 
-    current_text = ticker_filter.get()
-    
-    # 計算新的 values
-    if not current_text:
-        new_values = all_tickers
-    else:
-        # 簡單的子字串搜尋 (case-insensitive)
-        new_values = [t for t in all_tickers if current_text.lower() in t.lower()]
-    
-    # 檢查是否需要更新 (避免不必要的重繪)
-    current_values = []
-    try:
-        current_values = list(ticker_filter['values'])
-    except:
-        pass
-        
-    if new_values != current_values:
-        ticker_filter['values'] = new_values
-        
-        # 若有搜尋結果，嘗試展開選單
-        if new_values:
-            try:
-                ticker_filter.tk.call('ttk::combobox::Post', ticker_filter._w)
-            except:
-                pass
+        value = self.get()
+        if not value:
+            filtered = all_tickers
         else:
-            try:
-                ticker_filter.tk.call('ttk::combobox::Unpost', ticker_filter._w)
-            except:
-                pass
+            filtered = [t for t in all_tickers if value.lower() in t.lower()]
+        
+        # 更新原生 values 但不自動 Post (避免游標跳動)
+        self['values'] = filtered
+        
+        if filtered:
+            self.show_listbox(filtered)
+        else:
+            self.hide_listbox()
 
-        # 立即還原游標位置並清除選取
-        try:
-            ticker_filter.selection_clear()
-            ticker_filter.icursor(cursor_pos)
-        except:
-            pass
+    def show_listbox(self, values):
+        if not self._listbox_window:
+            self._listbox_window = tk.Toplevel(self)
+            self._listbox_window.wm_overrideredirect(True)
+            self._listbox_window.wm_attributes("-topmost", True)
+            
+            # 嘗試獲取主題顏色
+            style = ttk.Style()
+            try:
+                bg = style.lookup('TEntry', 'fieldbackground')
+                fg = style.lookup('TEntry', 'foreground')
+                sel_bg = style.lookup('TEntry', 'selectbackground')
+                sel_fg = style.lookup('TEntry', 'selectforeground')
+            except:
+                bg = 'white'
+                fg = 'black'
+                sel_bg = 'blue'
+                sel_fg = 'white'
+            
+            self._listbox = tk.Listbox(self._listbox_window, height=5, bg=bg, fg=fg, 
+                                       selectbackground=sel_bg, selectforeground=sel_fg, 
+                                       relief="flat", borderwidth=1)
+            self._listbox.pack(fill='both', expand=True)
+            self._listbox.bind("<<ListboxSelect>>", self.on_select)
+        
+        self._listbox.delete(0, 'end')
+        for item in values:
+            self._listbox.insert('end', item)
+            
+        # 計算位置與大小
+        x = self.winfo_rootx()
+        y = self.winfo_rooty() + self.winfo_height()
+        w = self.winfo_width()
+        h = min(len(values), 10) * 20 # 估算高度
+        self._listbox_window.geometry(f"{w}x{h}+{x}+{y}")
+        self._listbox_window.deiconify()
+        self._listbox_window.lift()
+
+    def hide_listbox(self):
+        if self._listbox_window:
+            self._listbox_window.destroy()
+            self._listbox_window = None
+            self._listbox = None
+
+    def on_select(self, event):
+        if self._listbox and self._listbox.curselection():
+            index = self._listbox.curselection()[0]
+            val = self._listbox.get(index)
+            self.set(val)
+            self.hide_listbox()
+            self.icursor(tk.END)
+            self.selection_clear()
+
+    def on_focusout(self, event):
+        # 延遲關閉，以便讓點擊 Listbox 的事件先觸發
+        self.after(150, self.hide_listbox)
+
+    def on_return(self, event):
+        if self._listbox_window and self._listbox and self._listbox.size() > 0:
+             self.set(self._listbox.get(0))
+             self.hide_listbox()
+             self.icursor(tk.END)
 
 # --- GUI 建構 ---
 def build_gui():
@@ -850,9 +893,9 @@ def build_gui():
     filter_frame.grid(row=2, column=0, columnspan=2, sticky=W+E)
 
     ttk.Label(filter_frame, text="Ticker:").grid(row=0, column=0, sticky=E)
-    ticker_filter = ttk.Combobox(filter_frame)
+    ticker_filter = SearchCombobox(filter_frame)
     ticker_filter.grid(row=0, column=1, padx=5, sticky=W)
-    ticker_filter.bind('<KeyRelease>', on_ticker_type)
+    # ticker_filter.bind('<KeyRelease>', on_ticker_type) # 已整合至 SearchCombobox 類別中
 
     ttk.Label(filter_frame, text="起始日期:").grid(row=1, column=0, sticky=E)
     start_date_filter = DateEntry(filter_frame, bootstyle="dark", dateformat="%Y-%m-%d")
