@@ -226,45 +226,54 @@ def bulk_import():
     cancel_import = False
     inserted_count = 0
 
-    file_path = filedialog.askopenfilename(filetypes=[("Text Files", "*.txt"), ("CSV Files", "*.csv")])
-    if not file_path:
+    # 改用 askopenfilenames 支援多選
+    file_paths = filedialog.askopenfilenames(filetypes=[("Text Files", "*.txt"), ("CSV Files", "*.csv")])
+    if not file_paths:
         return
 
-    # 嘗試從檔名解析日期 (例如: 20251212_TV Code.txt)
-    filename = os.path.basename(file_path)
-    default_date = None
-    date_match = re.search(r"(\d{8})", filename)
-    if date_match:
-        try:
-            default_date = pd.to_datetime(date_match.group(1), format='%Y%m%d').date().isoformat()
-        except:
-            pass
-    
-    current_date = default_date
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f.readlines() if line.strip()]
-
-    for line in lines:
+    for file_path in file_paths:
         if cancel_import:
-            messagebox.showinfo("已取消", f"成功寫入 {inserted_count} 筆資料。")
-            return
-        
-        # 判斷是否為 GEX Code 行 (包含 ":")
-        if ":" in line:
-            # 若無 current_date，使用當日作為備案 (parse_gex_code 會優先嘗試內嵌日期)
-            use_date = current_date if current_date else datetime.date.today().isoformat()
-            parse_gex_code(use_date, line)
-        else:
-            # 嘗試解析為日期行 (舊格式相容)
+            break
+
+        # 嘗試從檔名解析日期 (例如: 20251212_TV Code.txt)
+        filename = os.path.basename(file_path)
+        default_date = None
+        date_match = re.search(r"(\d{8})", filename)
+        if date_match:
             try:
-                potential_date = line.split("_")[0]
-                pd.to_datetime(potential_date)
-                current_date = potential_date
+                default_date = pd.to_datetime(date_match.group(1), format='%Y%m%d').date().isoformat()
             except:
                 pass
+        
+        current_date = default_date
 
-    if not cancel_import:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f.readlines() if line.strip()]
+
+            for line in lines:
+                if cancel_import:
+                    break
+                
+                # 判斷是否為 GEX Code 行 (包含 ":")
+                if ":" in line:
+                    # 若無 current_date，使用當日作為備案 (parse_gex_code 會優先嘗試內嵌日期)
+                    use_date = current_date if current_date else datetime.date.today().isoformat()
+                    parse_gex_code(use_date, line)
+                else:
+                    # 嘗試解析為日期行 (舊格式相容)
+                    try:
+                        potential_date = line.split("_")[0]
+                        pd.to_datetime(potential_date)
+                        current_date = potential_date
+                    except:
+                        pass
+        except Exception as e:
+            print(f"讀取檔案失敗 {file_path}: {e}")
+
+    if cancel_import:
+        messagebox.showinfo("已取消", f"成功寫入 {inserted_count} 筆資料。")
+    else:
         populate_ticker_dropdown()
         refresh_table()
         messagebox.showinfo("匯入完成", f"成功寫入 {inserted_count} 筆資料。")
