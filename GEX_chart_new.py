@@ -230,17 +230,39 @@ def bulk_import():
     if not file_path:
         return
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
+    # 嘗試從檔名解析日期 (例如: 20251212_TV Code.txt)
+    filename = os.path.basename(file_path)
+    default_date = None
+    date_match = re.search(r"(\d{8})", filename)
+    if date_match:
+        try:
+            default_date = pd.to_datetime(date_match.group(1), format='%Y%m%d').date().isoformat()
+        except:
+            pass
+    
+    current_date = default_date
 
-    for i in range(0, len(lines), 2):
+    with open(file_path, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f.readlines() if line.strip()]
+
+    for line in lines:
         if cancel_import:
             messagebox.showinfo("已取消", f"成功寫入 {inserted_count} 筆資料。")
             return
-        date = lines[i].strip().split("_")[0]
-        if i + 1 < len(lines):
-            gex_code = lines[i + 1].strip()
-            parse_gex_code(date, gex_code)
+        
+        # 判斷是否為 GEX Code 行 (包含 ":")
+        if ":" in line:
+            # 若無 current_date，使用當日作為備案 (parse_gex_code 會優先嘗試內嵌日期)
+            use_date = current_date if current_date else datetime.date.today().isoformat()
+            parse_gex_code(use_date, line)
+        else:
+            # 嘗試解析為日期行 (舊格式相容)
+            try:
+                potential_date = line.split("_")[0]
+                pd.to_datetime(potential_date)
+                current_date = potential_date
+            except:
+                pass
 
     if not cancel_import:
         populate_ticker_dropdown()
